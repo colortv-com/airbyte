@@ -481,7 +481,7 @@ def _fetch_by_ids(api, ids: List[str], fields: str) -> dict:
 
     Uses url_override to call GET /?ids=... which is the multi-ID lookup endpoint.
     """
-    base_url = f"https://graph.facebook.com/{api.api.API_VERSION}"
+    base_url = "https://graph.facebook.com"
     all_results: dict = {}
 
     for i in range(0, len(ids), INSIGHTS_BATCH_SIZE):
