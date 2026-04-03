@@ -518,7 +518,8 @@ class AdsFilteredByInsights(Ads):
         stream_state: Mapping[str, Any] = None,
     ) -> Iterable[Mapping[str, Any]]:
         account_id = stream_slice["account_id"]
-        ad_ids = _get_ad_ids_from_insights(self._api, account_id, self._start_date, self._end_date)
+        # No date filter — fetch all ad_ids that ever appeared in insights for this account
+        ad_ids = _get_ad_ids_from_insights(self._api, account_id, None, None)
 
         if not ad_ids:
             return
@@ -535,9 +536,10 @@ class AdsFilteredByInsights(Ads):
 class AdCreativesFilteredByInsights(AdCreatives):
     """AdCreatives stream that only fetches creatives linked to ads in insights."""
 
-    def __init__(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, **kwargs):
-        self._insights_start_date = start_date
-        self._insights_end_date = end_date
+    def __init__(self, **kwargs):
+        # Accept and discard start_date/end_date passed from source.py
+        kwargs.pop("start_date", None)
+        kwargs.pop("end_date", None)
         super().__init__(**kwargs)
 
     @property
@@ -552,7 +554,8 @@ class AdCreativesFilteredByInsights(AdCreatives):
         stream_state: Mapping[str, Any] = None,
     ) -> Iterable[Mapping[str, Any]]:
         account_id = stream_slice["account_id"]
-        ad_ids = _get_ad_ids_from_insights(self._api, account_id, self._insights_start_date, self._insights_end_date)
+        # No date filter — fetch all ad_ids that ever appeared in insights for this account
+        ad_ids = _get_ad_ids_from_insights(self._api, account_id, None, None)
 
         if not ad_ids:
             return
