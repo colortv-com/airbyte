@@ -449,53 +449,37 @@ class AdsInsightsDemographicsGender(AdsInsights):
     action_breakdowns = ["action_type"]
 
 
-class InsightsAdIdsMixin:
-    """Mixin that collects ad_ids from insights for a given account and date range."""
+def _get_ad_ids_from_insights(api, account_id: str, start_date: Optional[datetime], end_date: Optional[datetime]) -> Set[str]:
+    """Fetch all unique ad_ids that appear in insights for a given date range."""
+    account = api.get_account(account_id=account_id)
+    params: dict = {
+        "level": "ad",
+        "fields": "ad_id",
+        "limit": 500,
+    }
+    if start_date and end_date:
+        since = start_date.isoformat()[:10] if hasattr(start_date, "isoformat") else str(start_date)[:10]
+        until = end_date.isoformat()[:10] if hasattr(end_date, "isoformat") else str(end_date)[:10]
+        params["time_range"] = json.dumps({"since": since, "until": until})
 
-    BATCH_SIZE = 50
+    ad_ids: Set[str] = set()
+    for row in account.get_insights(params=params):
+        ad_id = row.get("ad_id")
+        if ad_id:
+            ad_ids.add(ad_id)
 
-    def __init__(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, **kwargs):
-        # Store for our insights query
-        self._insights_start_date = start_date
-        self._insights_end_date = end_date
-        # Pass start_date/end_date through to parent (FBMarketingIncrementalStream needs them)
-        super().__init__(start_date=start_date, end_date=end_date, **kwargs)
-
-    def _get_ad_ids_from_insights(self, account_id: str) -> Set[str]:
-        """Fetch all unique ad_ids that appear in insights for the configured date range."""
-        account = self._api.get_account(account_id=account_id)
-        params = {
-            "level": "ad",
-            "fields": "ad_id",
-            "limit": 500,
-        }
-        if self._insights_start_date and self._insights_end_date:
-            since = self._insights_start_date
-            until = self._insights_end_date
-            if hasattr(since, "isoformat"):
-                since = since.isoformat()[:10]
-            if hasattr(until, "isoformat"):
-                until = until.isoformat()[:10]
-            params["time_range"] = json.dumps({"since": since, "until": until})
-
-        ad_ids: Set[str] = set()
-        insights = account.get_insights(params=params)
-        for row in insights:
-            ad_id = row.get("ad_id")
-            if ad_id:
-                ad_ids.add(ad_id)
-
-        logger.info(f"InsightsFilter: found {len(ad_ids)} unique ad_ids in insights for account {account_id}")
-        return ad_ids
+    logger.info(f"InsightsFilter: found {len(ad_ids)} unique ad_ids in insights for account {account_id}")
+    return ad_ids
 
 
-class AdsFilteredByInsights(InsightsAdIdsMixin, Ads):
-    """Ads stream that only fetches ads appearing in insights.
+INSIGHTS_BATCH_SIZE = 50
 
-    Instead of listing all ads from the account, this stream:
-    1. Queries insights to get ad_ids with actual spend/impressions
-    2. Fetches only those ads by ID using batch lookup (GET /?ids=...)
-    """
+
+class AdsFilteredByInsights(Ads):
+    """Ads stream that only fetches ads appearing in insights."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
     @property
     def name(self) -> str:
@@ -509,7 +493,7 @@ class AdsFilteredByInsights(InsightsAdIdsMixin, Ads):
         stream_state: Mapping[str, Any] = None,
     ) -> Iterable[Mapping[str, Any]]:
         account_id = stream_slice["account_id"]
-        ad_ids = self._get_ad_ids_from_insights(account_id)
+        ad_ids = _get_ad_ids_from_insights(self._api, account_id, self._start_date, self._end_date)
 
         if not ad_ids:
             return
@@ -517,10 +501,9 @@ class AdsFilteredByInsights(InsightsAdIdsMixin, Ads):
         fields_str = ",".join(self.fields())
         ad_ids_list = list(ad_ids)
 
-        for i in range(0, len(ad_ids_list), self.BATCH_SIZE):
-            batch = ad_ids_list[i : i + self.BATCH_SIZE]
-            api = self._api.api
-            response = api.call(
+        for i in range(0, len(ad_ids_list), INSIGHTS_BATCH_SIZE):
+            batch = ad_ids_list[i : i + INSIGHTS_BATCH_SIZE]
+            response = self._api.api.call(
                 method="GET",
                 path="/",
                 params={"ids": ",".join(batch), "fields": fields_str},
@@ -532,14 +515,13 @@ class AdsFilteredByInsights(InsightsAdIdsMixin, Ads):
                 yield ad_data
 
 
-class AdCreativesFilteredByInsights(InsightsAdIdsMixin, AdCreatives):
-    """AdCreatives stream that only fetches creatives linked to ads in insights.
+class AdCreativesFilteredByInsights(AdCreatives):
+    """AdCreatives stream that only fetches creatives linked to ads in insights."""
 
-    Flow:
-    1. Get ad_ids from insights
-    2. Get creative_ids from those ads (GET /?ids=...&fields=creative{id})
-    3. Fetch full creative details by ID
-    """
+    def __init__(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, **kwargs):
+        self._insights_start_date = start_date
+        self._insights_end_date = end_date
+        super().__init__(**kwargs)
 
     @property
     def name(self) -> str:
@@ -553,7 +535,7 @@ class AdCreativesFilteredByInsights(InsightsAdIdsMixin, AdCreatives):
         stream_state: Mapping[str, Any] = None,
     ) -> Iterable[Mapping[str, Any]]:
         account_id = stream_slice["account_id"]
-        ad_ids = self._get_ad_ids_from_insights(account_id)
+        ad_ids = _get_ad_ids_from_insights(self._api, account_id, self._insights_start_date, self._insights_end_date)
 
         if not ad_ids:
             return
@@ -563,8 +545,8 @@ class AdCreativesFilteredByInsights(InsightsAdIdsMixin, AdCreatives):
         ad_ids_list = list(ad_ids)
         api = self._api.api
 
-        for i in range(0, len(ad_ids_list), self.BATCH_SIZE):
-            batch = ad_ids_list[i : i + self.BATCH_SIZE]
+        for i in range(0, len(ad_ids_list), INSIGHTS_BATCH_SIZE):
+            batch = ad_ids_list[i : i + INSIGHTS_BATCH_SIZE]
             response = api.call(
                 method="GET",
                 path="/",
@@ -586,8 +568,8 @@ class AdCreativesFilteredByInsights(InsightsAdIdsMixin, AdCreatives):
         creative_fields = [f for f in self.fields() if f != "thumbnail_data_url"]
         creative_ids_list = list(creative_ids)
 
-        for i in range(0, len(creative_ids_list), self.BATCH_SIZE):
-            batch = creative_ids_list[i : i + self.BATCH_SIZE]
+        for i in range(0, len(creative_ids_list), INSIGHTS_BATCH_SIZE):
+            batch = creative_ids_list[i : i + INSIGHTS_BATCH_SIZE]
             response = api.call(
                 method="GET",
                 path="/",
