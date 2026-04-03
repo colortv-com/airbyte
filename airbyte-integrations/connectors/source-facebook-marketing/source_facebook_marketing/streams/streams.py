@@ -455,9 +455,11 @@ class InsightsAdIdsMixin:
     BATCH_SIZE = 50
 
     def __init__(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, **kwargs):
-        super().__init__(**kwargs)
+        # Store for our insights query
         self._insights_start_date = start_date
         self._insights_end_date = end_date
+        # Pass start_date/end_date through to parent (FBMarketingIncrementalStream needs them)
+        super().__init__(start_date=start_date, end_date=end_date, **kwargs)
 
     def _get_ad_ids_from_insights(self, account_id: str) -> Set[str]:
         """Fetch all unique ad_ids that appear in insights for the configured date range."""
