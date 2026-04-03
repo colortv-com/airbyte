@@ -26,8 +26,10 @@ from source_facebook_marketing.streams import (
     Activities,
     AdAccount,
     AdCreatives,
+    AdCreativesFilteredByInsights,
     AdCreativesFromAds,
     Ads,
+    AdsFilteredByInsights,
     AdSets,
     AdsInsights,
     AdsInsightsActionCarouselCard,
@@ -164,6 +166,41 @@ class SourceFacebookMarketing(AbstractSource):
             filter_statuses=[status.value for status in [*ValidAdStatuses]],
             include_incrementality=config.include_incrementality,
         )
+        # Choose Ads and AdCreatives stream implementations based on filter_by_insights flag
+        if config.filter_by_insights:
+            logger.info("filter_by_insights is enabled: Ads and AdCreatives will only include records from insights")
+            ads_stream = AdsFilteredByInsights(
+                api=api,
+                account_ids=config.account_ids,
+                start_date=report_start_date,
+                end_date=config.end_date,
+                filter_statuses=config.ad_statuses,
+                page_size=config.page_size,
+            )
+            ad_creatives_stream = AdCreativesFilteredByInsights(
+                api=api,
+                account_ids=config.account_ids,
+                start_date=report_start_date,
+                end_date=config.end_date,
+                fetch_thumbnail_images=config.fetch_thumbnail_images,
+                page_size=config.page_size,
+            )
+        else:
+            ads_stream = Ads(
+                api=api,
+                account_ids=config.account_ids,
+                start_date=config.start_date,
+                end_date=config.end_date,
+                filter_statuses=config.ad_statuses,
+                page_size=config.page_size,
+            )
+            ad_creatives_stream = AdCreatives(
+                api=api,
+                account_ids=config.account_ids,
+                fetch_thumbnail_images=config.fetch_thumbnail_images,
+                page_size=config.page_size,
+            )
+
         streams = [
             AdAccount(api=api, account_ids=config.account_ids),
             AdSets(
@@ -174,20 +211,8 @@ class SourceFacebookMarketing(AbstractSource):
                 filter_statuses=config.adset_statuses,
                 page_size=config.page_size,
             ),
-            Ads(
-                api=api,
-                account_ids=config.account_ids,
-                start_date=config.start_date,
-                end_date=config.end_date,
-                filter_statuses=config.ad_statuses,
-                page_size=config.page_size,
-            ),
-            AdCreatives(
-                api=api,
-                account_ids=config.account_ids,
-                fetch_thumbnail_images=config.fetch_thumbnail_images,
-                page_size=config.page_size,
-            ),
+            ads_stream,
+            ad_creatives_stream,
             AdCreativesFromAds(
                 api=api,
                 account_ids=config.account_ids,
