@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Iterable, List, Mapping, Optional, Set
 
 import requests
+from facebook_business.adobjects.ad import Ad as FBAd
 from facebook_business.adobjects.adaccount import AdAccount as FBAdAccount
 from facebook_business.adobjects.adcreative import AdCreative as FBAdCreative
 from facebook_business.adobjects.adimage import AdImage
@@ -475,6 +476,30 @@ def _get_ad_ids_from_insights(api, account_id: str, start_date: Optional[datetim
 INSIGHTS_BATCH_SIZE = 50
 
 
+def _fetch_by_ids(api, ids: List[str], fields: str) -> dict:
+    """Batch-fetch Facebook objects by IDs (up to 50 per request).
+
+    Uses url_override to call GET /?ids=... which is the multi-ID lookup endpoint.
+    """
+    base_url = f"https://graph.facebook.com/{api.api.API_VERSION}"
+    all_results: dict = {}
+
+    for i in range(0, len(ids), INSIGHTS_BATCH_SIZE):
+        batch = ids[i : i + INSIGHTS_BATCH_SIZE]
+        try:
+            response = api.api.call(
+                method="GET",
+                path=[],
+                params={"ids": ",".join(batch), "fields": fields},
+                url_override=base_url,
+            )
+            all_results.update(response.json())
+        except FacebookRequestError as e:
+            logger.warning(f"Failed to batch-fetch IDs: {e}")
+
+    return all_results
+
+
 class AdsFilteredByInsights(Ads):
     """Ads stream that only fetches ads appearing in insights."""
 
@@ -499,20 +524,12 @@ class AdsFilteredByInsights(Ads):
             return
 
         fields_str = ",".join(self.fields())
-        ad_ids_list = list(ad_ids)
+        data = _fetch_by_ids(self._api, list(ad_ids), fields_str)
 
-        for i in range(0, len(ad_ids_list), INSIGHTS_BATCH_SIZE):
-            batch = ad_ids_list[i : i + INSIGHTS_BATCH_SIZE]
-            response = self._api.api.call(
-                method="GET",
-                path="/",
-                params={"ids": ",".join(batch), "fields": fields_str},
-            )
-            data = response.json()
-            for ad_id, ad_data in data.items():
-                self.fix_date_time(ad_data)
-                self.add_account_id(ad_data, account_id)
-                yield ad_data
+        for ad_id, ad_data in data.items():
+            self.fix_date_time(ad_data)
+            self.add_account_id(ad_data, account_id)
+            yield ad_data
 
 
 class AdCreativesFilteredByInsights(AdCreatives):
@@ -540,49 +557,31 @@ class AdCreativesFilteredByInsights(AdCreatives):
         if not ad_ids:
             return
 
-        # Step 2: get creative_ids from ads
+        # Step 2: get creative_ids from ads (batch)
+        ads_data = _fetch_by_ids(self._api, list(ad_ids), "id,creative{id}")
         creative_ids: Set[str] = set()
-        ad_ids_list = list(ad_ids)
-        api = self._api.api
-
-        for i in range(0, len(ad_ids_list), INSIGHTS_BATCH_SIZE):
-            batch = ad_ids_list[i : i + INSIGHTS_BATCH_SIZE]
-            response = api.call(
-                method="GET",
-                path="/",
-                params={"ids": ",".join(batch), "fields": "id,creative{id}"},
-            )
-            data = response.json()
-            for ad_data in data.values():
-                creative = ad_data.get("creative", {})
-                cid = creative.get("id")
-                if cid:
-                    creative_ids.add(cid)
+        for ad_data in ads_data.values():
+            creative = ad_data.get("creative", {})
+            cid = creative.get("id")
+            if cid:
+                creative_ids.add(cid)
 
         logger.info(f"InsightsFilter: found {len(creative_ids)} unique creatives for account {account_id}")
 
         if not creative_ids:
             return
 
-        # Step 3: fetch full creative details
+        # Step 3: fetch full creative details (batch)
         creative_fields = [f for f in self.fields() if f != "thumbnail_data_url"]
-        creative_ids_list = list(creative_ids)
+        creatives_data = _fetch_by_ids(self._api, list(creative_ids), ",".join(creative_fields))
 
-        for i in range(0, len(creative_ids_list), INSIGHTS_BATCH_SIZE):
-            batch = creative_ids_list[i : i + INSIGHTS_BATCH_SIZE]
-            response = api.call(
-                method="GET",
-                path="/",
-                params={"ids": ",".join(batch), "fields": ",".join(creative_fields)},
-            )
-            data = response.json()
-            for creative_data in data.values():
-                self.fix_date_time(creative_data)
-                self.add_account_id(creative_data, account_id)
+        for creative_data in creatives_data.values():
+            self.fix_date_time(creative_data)
+            self.add_account_id(creative_data, account_id)
 
-                if self._fetch_thumbnail_images:
-                    thumbnail_url = creative_data.get("thumbnail_url")
-                    if thumbnail_url:
-                        creative_data["thumbnail_data_url"] = fetch_thumbnail_data_url(thumbnail_url)
+            if self._fetch_thumbnail_images:
+                thumbnail_url = creative_data.get("thumbnail_url")
+                if thumbnail_url:
+                    creative_data["thumbnail_data_url"] = fetch_thumbnail_data_url(thumbnail_url)
 
-                yield creative_data
+            yield creative_data
