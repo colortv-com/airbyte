@@ -467,14 +467,12 @@ def _get_ad_ids_from_insights(api, account_id: str, start_date: Optional[datetim
     since = start_date.date() if hasattr(start_date, "date") else start_date
     until = end_date.date() if hasattr(end_date, "date") else end_date
 
-    # Use same fields as AdsInsights stream — FB API returns different ad sets
-    # depending on requested fields (e.g., 90 ads with just ad_id vs 179 with full fields).
-    insights_fields = list(AdsInsights().get_json_schema().get("properties", {}).keys())
-    insights_fields = [f for f in insights_fields if not f.startswith("_airbyte") and f != "account_id"]
-
+    # FB API returns different ad sets depending on requested fields.
+    # instant_experience_clicks_to_open + action_breakdowns unlocks the full set
+    # (same ads as the AdsInsights stream with 100+ fields).
     params: dict = {
         "level": "ad",
-        "fields": insights_fields,
+        "fields": ["ad_id", "instant_experience_clicks_to_open"],
         "action_attribution_windows": ["1d_click", "7d_click", "28d_click", "1d_view"],
         "action_breakdowns": ["action_type", "action_target_id", "action_destination"],
         "filtering": [{
