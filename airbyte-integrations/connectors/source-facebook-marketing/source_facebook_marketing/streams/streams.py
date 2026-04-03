@@ -5,8 +5,8 @@
 import base64
 import json
 import logging
-from datetime import datetime
-from typing import Any, Iterable, List, Mapping, Optional, Set
+from datetime import datetime, timedelta
+from typing import Any, Iterable, Iterator, List, Mapping, Optional, Set
 
 import requests
 from facebook_business.adobjects.ad import Ad as FBAd
@@ -22,8 +22,12 @@ from airbyte_cdk.sources.utils.schema_helpers import ResourceSchemaLoader
 from airbyte_cdk.utils.datetime_helpers import AirbyteDateTime, ab_datetime_parse
 from source_facebook_marketing.spec import ValidAdSetStatuses, ValidAdStatuses, ValidCampaignStatuses
 
+from .async_job import InsightAsyncJob
+from .async_job_manager import InsightAsyncJobManager
 from .base_insight_streams import AdsInsights
 from .base_streams import FBMarketingIncrementalStream, FBMarketingReversedIncrementalStream, FBMarketingStream
+
+from source_facebook_marketing.utils import DateInterval
 
 
 logger = logging.getLogger("airbyte")
@@ -451,23 +455,50 @@ class AdsInsightsDemographicsGender(AdsInsights):
 
 
 def _get_ad_ids_from_insights(api, account_id: str, start_date: Optional[datetime], end_date: Optional[datetime]) -> Set[str]:
-    """Fetch all unique ad_ids that appear in insights for a given date range."""
-    account = api.get_account(account_id=account_id)
+    """Fetch all unique ad_ids from insights using daily async jobs (same as AdsInsights stream).
+
+    Uses InsightAsyncJobManager for batched parallel execution of daily jobs.
+    Includes action_attribution_windows to capture ads with attributed conversions.
+    Only requests ad_id field to keep it lightweight.
+    """
+    if not start_date or not end_date:
+        return set()
+
+    since = start_date.date() if hasattr(start_date, "date") else start_date
+    until = end_date.date() if hasattr(end_date, "date") else end_date
+
     params: dict = {
         "level": "ad",
-        "fields": "ad_id",
-        "limit": 500,
+        "fields": ["ad_id"],
+        "action_attribution_windows": ["1d_click", "7d_click", "28d_click", "1d_view"],
+        "filtering": [{
+            "field": "ad.effective_status",
+            "operator": "IN",
+            "value": [s.value for s in ValidAdStatuses],
+        }],
     }
-    if start_date and end_date:
-        since = start_date.isoformat()[:10] if hasattr(start_date, "isoformat") else str(start_date)[:10]
-        until = end_date.isoformat()[:10] if hasattr(end_date, "isoformat") else str(end_date)[:10]
-        params["time_range"] = json.dumps({"since": since, "until": until})
+
+    def _daily_jobs() -> Iterator[InsightAsyncJob]:
+        d = since
+        while d <= until:
+            yield InsightAsyncJob(
+                api=api.api,
+                edge_object=api.get_account(account_id=account_id),
+                interval=DateInterval(start=d, end=d),
+                params=params,
+                job_timeout=timedelta(minutes=60),
+            )
+            d += timedelta(days=1)
+
+    manager = InsightAsyncJobManager(api=api, jobs=_daily_jobs(), account_id=account_id)
 
     ad_ids: Set[str] = set()
-    for row in account.get_insights(params=params):
-        ad_id = row.get("ad_id")
-        if ad_id:
-            ad_ids.add(ad_id)
+    for job in manager.completed_jobs():
+        for row in job.get_result():
+            data = row.export_all_data() if hasattr(row, "export_all_data") else dict(row)
+            ad_id = data.get("ad_id")
+            if ad_id:
+                ad_ids.add(ad_id)
 
     logger.info(f"InsightsFilter: found {len(ad_ids)} unique ad_ids in insights for account {account_id}")
     return ad_ids
