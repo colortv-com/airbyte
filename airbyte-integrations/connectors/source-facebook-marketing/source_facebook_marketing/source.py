@@ -172,7 +172,7 @@ class SourceFacebookMarketing(AbstractSource):
             ads_stream = AdsFilteredByInsights(
                 api=api,
                 account_ids=config.account_ids,
-                start_date=config.start_date,
+                start_date=report_start_date,
                 end_date=config.end_date,
                 filter_statuses=config.ad_statuses,
                 page_size=config.page_size,
@@ -180,7 +180,7 @@ class SourceFacebookMarketing(AbstractSource):
             ad_creatives_stream = AdCreativesFilteredByInsights(
                 api=api,
                 account_ids=config.account_ids,
-                start_date=config.start_date,
+                start_date=report_start_date,
                 end_date=config.end_date,
                 fetch_thumbnail_images=config.fetch_thumbnail_images,
                 page_size=config.page_size,
