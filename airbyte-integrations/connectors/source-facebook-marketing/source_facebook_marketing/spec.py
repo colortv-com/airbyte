@@ -380,6 +380,17 @@ class ConnectorConfig(BaseConfig):
         default=False,
     )
 
+    filter_by_insights: bool = Field(
+        title="Filter Ads & Creatives by Insights",
+        order=14,
+        default=False,
+        description=(
+            "When enabled, the Ads and AdCreatives streams will only fetch records "
+            "that appear in insights for the configured date range. This dramatically "
+            "reduces the number of API calls and avoids rate limits on large accounts."
+        ),
+    )
+
     action_breakdowns_allow_empty: bool = Field(
         description="Allows action_breakdowns to be an empty list",
         default=True,

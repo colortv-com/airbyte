@@ -3,10 +3,13 @@
 #
 
 import base64
+import json
 import logging
-from typing import Any, Iterable, List, Mapping, Optional, Set
+from datetime import datetime, timedelta
+from typing import Any, Iterable, Iterator, List, Mapping, Optional, Set
 
 import requests
+from facebook_business.adobjects.ad import Ad as FBAd
 from facebook_business.adobjects.adaccount import AdAccount as FBAdAccount
 from facebook_business.adobjects.adcreative import AdCreative as FBAdCreative
 from facebook_business.adobjects.adimage import AdImage
@@ -19,8 +22,12 @@ from airbyte_cdk.sources.utils.schema_helpers import ResourceSchemaLoader
 from airbyte_cdk.utils.datetime_helpers import AirbyteDateTime, ab_datetime_parse
 from source_facebook_marketing.spec import ValidAdSetStatuses, ValidAdStatuses, ValidCampaignStatuses
 
+from .async_job import InsightAsyncJob
+from .async_job_manager import InsightAsyncJobManager
 from .base_insight_streams import AdsInsights
 from .base_streams import FBMarketingIncrementalStream, FBMarketingReversedIncrementalStream, FBMarketingStream
+
+from source_facebook_marketing.utils import DateInterval
 
 
 logger = logging.getLogger("airbyte")
@@ -445,3 +452,264 @@ class AdsInsightsDemographicsDMARegion(AdsInsights):
 class AdsInsightsDemographicsGender(AdsInsights):
     breakdowns = ["gender"]
     action_breakdowns = ["action_type"]
+
+
+# Per-process memo so the four filtered streams (ads, ad_creatives, ad_sets, campaigns)
+# share a single insights pass per (account, date range) instead of running it 4x.
+# Scope = lifetime of the source process = one Airbyte sync.
+_INSIGHTS_ID_CACHE: dict = {}
+
+
+def _get_entity_ids_from_insights(
+    api, account_id: str, start_date: Optional[datetime], end_date: Optional[datetime]
+) -> Mapping[str, Set[str]]:
+    """Fetch unique ad_ids, adset_ids, campaign_ids from insights using daily async jobs.
+
+    Uses InsightAsyncJobManager for batched parallel execution of daily jobs (matches AdsInsights stream).
+    Includes action_attribution_windows to capture ads with attributed conversions.
+    Each ad-level insight row carries its parent adset_id and campaign_id, so a single
+    pass at level=ad yields all three id sets.
+
+    Result is memoized in `_INSIGHTS_ID_CACHE` keyed by (account_id, since_iso, until_iso).
+    Keying on normalized date strings (not raw datetime/AirbyteDateTime) so that callers
+    using different datetime types but the same window get the same cache entry.
+    """
+    if not start_date or not end_date:
+        return {"ad_ids": set(), "adset_ids": set(), "campaign_ids": set()}
+
+    since = start_date.date() if hasattr(start_date, "date") else start_date
+    until = end_date.date() if hasattr(end_date, "date") else end_date
+
+    cache_key = (account_id, since.isoformat(), until.isoformat())
+    if cache_key in _INSIGHTS_ID_CACHE:
+        logger.info(f"InsightsFilter: cache hit for account {account_id}")
+        return _INSIGHTS_ID_CACHE[cache_key]
+
+    # FB API returns different ad sets depending on requested fields.
+    # instant_experience_clicks_to_open + action_breakdowns unlocks the full set
+    # (same ads as the AdsInsights stream with 100+ fields).
+    params: dict = {
+        "level": "ad",
+        "fields": ["ad_id", "adset_id", "campaign_id", "instant_experience_clicks_to_open"],
+        "action_attribution_windows": ["1d_click", "7d_click", "28d_click", "1d_view"],
+        "action_breakdowns": ["action_type", "action_target_id", "action_destination"],
+        "filtering": [{
+            "field": "ad.effective_status",
+            "operator": "IN",
+            "value": [s.value for s in ValidAdStatuses],
+        }],
+    }
+
+    def _daily_jobs() -> Iterator[InsightAsyncJob]:
+        d = since
+        while d <= until:
+            yield InsightAsyncJob(
+                api=api.api,
+                edge_object=api.get_account(account_id=account_id),
+                interval=DateInterval(start=d, end=d),
+                params=params,
+                job_timeout=timedelta(minutes=60),
+            )
+            d += timedelta(days=1)
+
+    manager = InsightAsyncJobManager(api=api, jobs=_daily_jobs(), account_id=account_id)
+
+    ad_ids: Set[str] = set()
+    adset_ids: Set[str] = set()
+    campaign_ids: Set[str] = set()
+    for job in manager.completed_jobs():
+        for row in job.get_result():
+            data = row.export_all_data() if hasattr(row, "export_all_data") else dict(row)
+            if data.get("ad_id"):
+                ad_ids.add(data["ad_id"])
+            if data.get("adset_id"):
+                adset_ids.add(data["adset_id"])
+            if data.get("campaign_id"):
+                campaign_ids.add(data["campaign_id"])
+
+    logger.info(
+        f"InsightsFilter: account {account_id} — "
+        f"{len(ad_ids)} ads, {len(adset_ids)} adsets, {len(campaign_ids)} campaigns"
+    )
+    result = {"ad_ids": ad_ids, "adset_ids": adset_ids, "campaign_ids": campaign_ids}
+    _INSIGHTS_ID_CACHE[cache_key] = result
+    return result
+
+
+def _get_ad_ids_from_insights(api, account_id: str, start_date: Optional[datetime], end_date: Optional[datetime]) -> Set[str]:
+    """Backwards-compatible wrapper that returns only the ad_id set."""
+    return _get_entity_ids_from_insights(api, account_id, start_date, end_date)["ad_ids"]
+
+
+INSIGHTS_BATCH_SIZE = 50
+
+
+def _fetch_by_ids(api, ids: List[str], fields: str) -> dict:
+    """Batch-fetch Facebook objects by IDs (up to 50 per request).
+
+    Uses url_override to call GET /?ids=... which is the multi-ID lookup endpoint.
+    """
+    base_url = "https://graph.facebook.com"
+    all_results: dict = {}
+
+    for i in range(0, len(ids), INSIGHTS_BATCH_SIZE):
+        batch = ids[i : i + INSIGHTS_BATCH_SIZE]
+        try:
+            response = api.api.call(
+                method="GET",
+                path=[],
+                params={"ids": ",".join(batch), "fields": fields},
+                url_override=base_url,
+            )
+            all_results.update(response.json())
+        except FacebookRequestError as e:
+            logger.warning(f"Failed to batch-fetch IDs: {e}")
+
+    return all_results
+
+
+class AdsFilteredByInsights(Ads):
+    """Ads stream that only fetches ads appearing in insights."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @property
+    def name(self) -> str:
+        return "ads"
+
+    def read_records(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: List[str] = None,
+        stream_slice: Mapping[str, Any] = None,
+        stream_state: Mapping[str, Any] = None,
+    ) -> Iterable[Mapping[str, Any]]:
+        account_id = stream_slice["account_id"]
+        # Use same date range as insights streams (report_start_date / end_date)
+        ad_ids = _get_ad_ids_from_insights(self._api, account_id, self._start_date, self._end_date)
+
+        if not ad_ids:
+            return
+
+        fields_str = ",".join(self.fields())
+        data = _fetch_by_ids(self._api, list(ad_ids), fields_str)
+
+        for ad_id, ad_data in data.items():
+            self.fix_date_time(ad_data)
+            self.add_account_id(ad_data, account_id)
+            yield ad_data
+
+
+class AdSetsFilteredByInsights(AdSets):
+    """AdSets stream that only fetches adsets appearing in insights."""
+
+    @property
+    def name(self) -> str:
+        return "ad_sets"
+
+    def read_records(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: List[str] = None,
+        stream_slice: Mapping[str, Any] = None,
+        stream_state: Mapping[str, Any] = None,
+    ) -> Iterable[Mapping[str, Any]]:
+        account_id = stream_slice["account_id"]
+        adset_ids = _get_entity_ids_from_insights(self._api, account_id, self._start_date, self._end_date)["adset_ids"]
+
+        if not adset_ids:
+            return
+
+        fields_str = ",".join(self.fields())
+        data = _fetch_by_ids(self._api, list(adset_ids), fields_str)
+
+        for adset_data in data.values():
+            self.fix_date_time(adset_data)
+            self.add_account_id(adset_data, account_id)
+            yield adset_data
+
+
+class CampaignsFilteredByInsights(Campaigns):
+    """Campaigns stream that only fetches campaigns appearing in insights."""
+
+    @property
+    def name(self) -> str:
+        return "campaigns"
+
+    def read_records(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: List[str] = None,
+        stream_slice: Mapping[str, Any] = None,
+        stream_state: Mapping[str, Any] = None,
+    ) -> Iterable[Mapping[str, Any]]:
+        account_id = stream_slice["account_id"]
+        campaign_ids = _get_entity_ids_from_insights(self._api, account_id, self._start_date, self._end_date)["campaign_ids"]
+
+        if not campaign_ids:
+            return
+
+        fields_str = ",".join(self.fields())
+        data = _fetch_by_ids(self._api, list(campaign_ids), fields_str)
+
+        for campaign_data in data.values():
+            self.fix_date_time(campaign_data)
+            self.add_account_id(campaign_data, account_id)
+            yield campaign_data
+
+
+class AdCreativesFilteredByInsights(AdCreatives):
+    """AdCreatives stream that only fetches creatives linked to ads in insights."""
+
+    def __init__(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, **kwargs):
+        self._insights_start_date = start_date
+        self._insights_end_date = end_date
+        super().__init__(**kwargs)
+
+    @property
+    def name(self) -> str:
+        return "ad_creatives"
+
+    def read_records(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: List[str] = None,
+        stream_slice: Mapping[str, Any] = None,
+        stream_state: Mapping[str, Any] = None,
+    ) -> Iterable[Mapping[str, Any]]:
+        account_id = stream_slice["account_id"]
+        # Use same date range as insights streams
+        ad_ids = _get_ad_ids_from_insights(self._api, account_id, self._insights_start_date, self._insights_end_date)
+
+        if not ad_ids:
+            return
+
+        # Step 2: get creative_ids from ads (batch)
+        ads_data = _fetch_by_ids(self._api, list(ad_ids), "id,creative{id}")
+        creative_ids: Set[str] = set()
+        for ad_data in ads_data.values():
+            creative = ad_data.get("creative", {})
+            cid = creative.get("id")
+            if cid:
+                creative_ids.add(cid)
+
+        logger.info(f"InsightsFilter: found {len(creative_ids)} unique creatives for account {account_id}")
+
+        if not creative_ids:
+            return
+
+        # Step 3: fetch full creative details (batch)
+        creative_fields = [f for f in self.fields() if f != "thumbnail_data_url"]
+        creatives_data = _fetch_by_ids(self._api, list(creative_ids), ",".join(creative_fields))
+
+        for creative_data in creatives_data.values():
+            self.fix_date_time(creative_data)
+            self.add_account_id(creative_data, account_id)
+
+            if self._fetch_thumbnail_images:
+                thumbnail_url = creative_data.get("thumbnail_url")
+                if thumbnail_url:
+                    creative_data["thumbnail_data_url"] = fetch_thumbnail_data_url(thumbnail_url)
+
+            yield creative_data
